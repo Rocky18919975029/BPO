@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.dapo import DAPORewardManager as RewardLoopDAPORewardManager
+from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager.dapo import DAPORewardManager
 
 
@@ -125,3 +126,61 @@ def test_reward_loop_construct_with_overlong_buffer_disabled():
         config=config, tokenizer=_DummyTokenizer(), compute_score=_constant_compute_score
     )
     assert reward_manager.max_resp_len is None
+
+
+def test_default_compute_score_honors_strict_box_verify():
+    default_result = default_compute_score("math_dapo", "Answer: 4", "4")
+    strict_unboxed_result = default_compute_score("math_dapo", "Answer: 4", "4", strict_box_verify=True)
+    strict_boxed_result = default_compute_score(
+        "math_dapo", r"Therefore, the answer is \boxed{4}", "4", strict_box_verify=True
+    )
+
+    assert default_result["acc"] is True
+    assert strict_unboxed_result["acc"] is False
+    assert strict_boxed_result["acc"] is True
+    assert strict_boxed_result["pred"] == "4"
+
+
+@pytest.mark.parametrize(
+    ("strict_box_verify", "expected"),
+    [(True, True), ("true", True), ("YES", True), ("1", True), ("on", True), (False, False), ("false", False)],
+)
+def test_dapo_reward_manager_forwards_strict_box_verify(strict_box_verify, expected):
+    received_kwargs = {}
+
+    def compute_score(**kwargs):
+        received_kwargs.update(kwargs)
+        return 0.5
+
+    reward_manager = DAPORewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=compute_score,
+        strict_box_verify=strict_box_verify,
+    )
+    reward_manager(_make_data(batch_size=1))
+
+    assert received_kwargs["strict_box_verify"] is expected
+
+
+@pytest.mark.parametrize("use_async_compute_score", [False, True])
+def test_reward_loop_dapo_manager_forwards_strict_box_verify(use_async_compute_score):
+    received_kwargs = {}
+
+    def sync_compute_score(**kwargs):
+        received_kwargs.update(kwargs)
+        return 0.5
+
+    async def async_compute_score(**kwargs):
+        received_kwargs.update(kwargs)
+        return 0.5
+
+    compute_score = async_compute_score if use_async_compute_score else sync_compute_score
+
+    config = OmegaConf.create({"reward": {"reward_kwargs": {"strict_box_verify": "true"}}})
+    reward_manager = RewardLoopDAPORewardManager(
+        config=config, tokenizer=_DummyTokenizer(), compute_score=compute_score
+    )
+    reward_manager.loop.run_until_complete(reward_manager.run_single(_make_data(batch_size=1)))
+
+    assert received_kwargs["strict_box_verify"] is True
