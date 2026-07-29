@@ -682,6 +682,58 @@ class FSDPEngine(BaseEngine):
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
+    @staticmethod
+    def _local_squared_gradient_norm(parameters, chunk_numel: int = 16 * 1024 * 1024) -> torch.Tensor:
+        """Accumulate a squared gradient norm with bounded cast memory."""
+        norm_sq = torch.zeros((), device=get_device_id(), dtype=torch.float64)
+        for parameter in parameters:
+            grad = parameter.grad
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+            flat_grad = grad.detach().reshape(-1)
+            for chunk in flat_grad.split(chunk_numel):
+                # FSDP mixed precision may leave a BF16 full gradient in
+                # no_sync(). Cast one bounded chunk at a time and accumulate
+                # chunk totals in FP64.
+                norm_sq += chunk.float().square().sum().to(torch.float64)
+        return norm_sq
+
+    def compute_exact_per_sample_gradient_norms(self, data: TensorDict, loss_function: Callable) -> torch.Tensor:
+        """Compute exact local per-response gradient norms with FSDP1 ``no_sync``.
+
+        Data-parallel ranks process different responses concurrently. ``no_sync``
+        is essential: without it FSDP would reduce gradients from those responses
+        together before the norm is measured. The tradeoff is that each rank
+        temporarily materializes a full, unsharded model gradient.
+        """
+        if fsdp_version(self.module) != 1 or not isinstance(self.module, FSDP):
+            raise NotImplementedError("Exact per-response gradient norms currently require FSDP1")
+        if self.ulysses_sequence_parallel_size != 1:
+            raise NotImplementedError("Exact per-response gradient norms do not support Ulysses sequence parallelism")
+        if getattr(self, "scaler", None) is not None:
+            raise NotImplementedError("Exact per-response gradient norms currently require BF16 or FP32 training")
+
+        norms = []
+        with self.train_mode(load_optimizer=False, zero_grad_on_exit=True):
+            for sample_index in range(data.shape[0]):
+                self.optimizer_zero_grad()
+                sample = data[sample_index : sample_index + 1]
+                with self.module.no_sync():
+                    loss, _ = self.forward_step(sample, loss_function=loss_function, forward_only=False)
+                    loss.backward()
+
+                norm_sq = self._local_squared_gradient_norm(self.module.parameters())
+                if not torch.isfinite(norm_sq):
+                    raise FloatingPointError(
+                        f"Non-finite exact score-gradient norm for local sample {sample_index}: {norm_sq.item()}"
+                    )
+                norms.append(norm_sq)
+                self.optimizer_zero_grad()
+
+        return torch.stack(norms) if norms else torch.empty(0, device=get_device_id(), dtype=torch.float64)
+
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
 

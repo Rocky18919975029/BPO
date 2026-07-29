@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GRPO_GRADIENT_NORM = "grpo_gradient_norm"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
@@ -329,6 +330,84 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.GRPO_GRADIENT_NORM)
+def compute_grpo_gradient_norm_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    score_grad_norm_sq: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GRPO advantages with an exact score-gradient-norm-weighted baseline.
+
+    This is an oracle ablation rather than the final scalable estimator. For each
+    response ``i`` in prompt group ``g`` it expects
+
+    ``score_grad_norm_sq[i] = ||grad_theta L_score(i)||_2^2``,
+
+    where ``L_score`` contains no reward or advantage multiplier. The group
+    baseline is
+
+    ``b_g = sum_i w_i r_i / sum_i w_i``.
+
+    The current response is deliberately included in the baseline so that this
+    estimator differs from ordinary GRPO only in its centering rule. Consequently
+    it is not action-independent; a later experiment should use leave-one-out
+    weighting to remove that source of bias.
+    """
+    del config
+
+    scores = token_level_rewards.sum(dim=-1)
+    if len(index) != scores.numel():
+        raise ValueError(f"index must contain one prompt id per response: got {len(index)} for {scores.numel()}")
+    weights = score_grad_norm_sq.reshape(-1).to(device=scores.device, dtype=torch.float64)
+    if weights.numel() != scores.numel():
+        raise ValueError(
+            "score_grad_norm_sq must contain one scalar per response: "
+            f"got {weights.numel()} weights for {scores.numel()} responses"
+        )
+    if not torch.isfinite(weights).all():
+        raise ValueError("score_grad_norm_sq contains NaN or infinity")
+    if (weights < 0).any():
+        raise ValueError("score_grad_norm_sq must be non-negative")
+
+    id2positions = defaultdict(list)
+    with torch.no_grad():
+        for position, prompt_id in enumerate(index):
+            id2positions[prompt_id].append(position)
+
+        scalar_advantages = torch.empty_like(scores)
+        for prompt_id, positions in id2positions.items():
+            if len(positions) == 1:
+                # Match ordinary GRPO's singleton behavior.
+                baseline = scores.new_tensor(0.0)
+                reward_std = scores.new_tensor(1.0)
+            else:
+                group_scores = scores[positions]
+                group_weights = weights[positions]
+                weight_sum = group_weights.sum()
+                if weight_sum <= 0:
+                    # If every score gradient is zero, the variance-optimal
+                    # baseline is undefined. Fall back to ordinary GRPO.
+                    baseline = group_scores.mean()
+                else:
+                    baseline = ((group_weights * group_scores.to(torch.float64)).sum() / weight_sum).to(
+                        group_scores.dtype
+                    )
+                reward_std = torch.std(group_scores)
+
+            centered = scores[positions] - baseline
+            if norm_adv_by_std_in_grpo:
+                centered = centered / (reward_std + epsilon)
+            scalar_advantages[positions] = centered
+
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

@@ -148,6 +148,14 @@ class BaseEngine:
             outputs = self.forward_backward_batch(data, loss_function, forward_only=True)
         return outputs
 
+    def compute_exact_per_sample_gradient_norms(self, data: TensorDict, loss_function: Callable) -> torch.Tensor:
+        """Compute one exact full-parameter squared gradient norm per sample.
+
+        Engines must override this method when they can expose unsynchronized
+        per-sample gradients without mixing data-parallel samples.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support exact per-sample gradient norms")
+
     def get_per_tensor_param(self) -> tuple[Generator[tuple[str, torch.Tensor], None, None], Optional[dict]]:
         """
         Get a generator that yields per-tensor parameters and optional peft config.
@@ -260,6 +268,7 @@ class BaseEngineCtx:
         assert self.mode in ("train", "eval")
         self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
         self.zero_grad_on_exit = kwargs.pop("zero_grad_on_exit", True)
+        self.load_optimizer = kwargs.pop("load_optimizer", self.mode == "train")
 
     def _context_switch(self, device):
         if self.disable_auto_offload:
@@ -273,7 +282,7 @@ class BaseEngineCtx:
             self.engine.to(
                 device=device,
                 model=self.engine.is_param_offload_enabled,
-                optimizer=self.engine.is_optimizer_offload_enabled,
+                optimizer=self.engine.is_optimizer_offload_enabled and self.load_optimizer,
                 grad=self.engine.is_param_offload_enabled,
             )
 

@@ -149,7 +149,11 @@ def compute_advantage_for_multi_trajectories(
     in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
     original ``compute_advantage()`` unchanged.
     """
-    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+    group_relative_estimators = {
+        core_algos.AdvantageEstimator.GRPO,
+        core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM,
+    }
+    if adv_estimator not in group_relative_estimators:
         return compute_advantage(
             data,
             adv_estimator=adv_estimator,

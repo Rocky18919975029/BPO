@@ -52,7 +52,7 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import exact_response_score_loss, ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -434,6 +434,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         return final_output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    def compute_exact_gradient_norm(self, data: TensorDict) -> TensorDict:
+        """Compute an exact reward-free score-gradient norm for every local response."""
+        maybe_fix_3d_position_ids(data)
+        default_keys = {
+            "use_remove_padding": self.model_config.get("use_remove_padding", False),
+            "use_fused_kernels": self.engine_config.use_fused_kernels,
+            "calculate_entropy": False,
+            "calculate_sum_pi_squared": False,
+            "distillation_use_topk": False,
+            "distillation_only": False,
+        }
+        for key, val in default_keys.items():
+            if key not in data.keys():
+                tu.assign_non_tensor(data, **{key: val})
+
+        norms = self.engine.compute_exact_per_sample_gradient_norms(
+            data=data,
+            loss_function=exact_response_score_loss,
+        )
+        return TensorDict(
+            {"score_grad_norm_sq": norms.cpu()},
+            batch_size=[data.shape[0]],
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
@@ -697,6 +722,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.infer_batch(data)
 
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_exact_gradient_norm")
+    @_with_routing_replay_flag(enabled=True)
+    def compute_exact_gradient_norm(self, data: TensorDict) -> TensorDict:
+        tu.assign_non_tensor(
+            data,
+            score_loss_agg_mode=self.config.actor.loss_agg_mode,
+            score_loss_scale_factor=self.config.actor.loss_scale_factor,
+        )
+        output = self.actor.compute_exact_gradient_norm(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

@@ -25,6 +25,45 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def exact_response_score_loss(model_output, data: TensorDict, dp_group=None):
+    """Return a reward-free score objective for one response.
+
+    The caller deliberately processes exactly one response at a time. Common
+    global normalization factors are omitted because they cancel in the
+    gradient-norm-weighted baseline. Response-dependent normalization is kept
+    so the norm matches the actor's configured aggregation rule.
+    """
+    del dp_group
+
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    mask_data = data.select("response_mask").to_padded_tensor()
+    response_mask = mask_data["response_mask"].to(dtype=log_prob.dtype)
+    if log_prob.shape[0] != 1:
+        raise ValueError(f"exact_response_score_loss expects one response, got batch size {log_prob.shape[0]}")
+
+    token_count = response_mask.sum()
+    loss_agg_mode = tu.get_non_tensor_data(data, key="score_loss_agg_mode", default="token-mean")
+    score_loss = -masked_sum(log_prob, response_mask)
+
+    # V1 may append synthetic padding rows to make a batch divisible across
+    # workers. Their response mask is empty, so their exact score gradient and
+    # squared norm are both zero.
+    if token_count <= 0:
+        return score_loss, {}
+
+    if loss_agg_mode == "seq-mean-token-mean":
+        score_loss = score_loss / token_count
+    elif loss_agg_mode == "seq-mean-token-sum-norm":
+        loss_scale_factor = tu.get_non_tensor_data(data, key="score_loss_scale_factor", default=None)
+        if loss_scale_factor is None:
+            loss_scale_factor = response_mask.shape[-1]
+        score_loss = score_loss / loss_scale_factor
+    elif loss_agg_mode not in {"token-mean", "seq-mean-token-sum"}:
+        raise ValueError(f"Unsupported score loss aggregation mode: {loss_agg_mode}")
+
+    return score_loss, {}
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]

@@ -507,16 +507,21 @@ class PPOTrainer(ABC):
             with marked_timer("values", timing_raw, color="cyan"):
                 batch = self._compute_values(batch, metrics=metrics)
 
-        # 7. compute advantage and return
+        # 7. [OPTIONAL] compute exact reward-free score-gradient norms
+        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+            with marked_timer("exact_gradient_norm", timing_raw, color="purple"):
+                batch = self._compute_exact_gradient_norm(batch, metrics=metrics)
+
+        # 8. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 
-        # 8. [OPTIONAL] update critic
+        # 9. [OPTIONAL] update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
                 batch = self._update_critic(batch, metrics=metrics)
 
-        # 9. update actor
+        # 10. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
@@ -1528,15 +1533,56 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _compute_exact_gradient_norm(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute exact full-parameter score-gradient norms on the actor workers."""
+        batch.extra_info.update(
+            {
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            }
+        )
+        output: KVBatchMeta = self.actor_rollout_wg.compute_exact_gradient_norm(batch)
+        assert len(output) == len(batch)
+
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["score_grad_norm_sq"],
+        )
+        norms = data["score_grad_norm_sq"].to(torch.float64)
+        non_padding = torch.tensor(
+            [not tag.get("is_padding", False) for tag in batch.tags],
+            dtype=torch.bool,
+            device=norms.device,
+        )
+        norms = norms[non_padding]
+        if norms.numel() > 0:
+            metrics.update(
+                {
+                    "gradient_norm_baseline/norm_sq_mean": norms.mean().item(),
+                    "gradient_norm_baseline/norm_sq_min": norms.min().item(),
+                    "gradient_norm_baseline/norm_sq_max": norms.max().item(),
+                }
+            )
+        return batch
+
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+            fields.append("score_grad_norm_sq")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+            # Synthetic balancing rows inherit a real UID as a metadata
+            # template. Give each one a unique singleton group so its zero
+            # reward/gradient cannot alter a real prompt's baseline or std.
+            for position, tag in enumerate(batch.tags):
+                if tag.get("is_padding", False):
+                    data.non_tensor_batch["uid"][position] = f"__padding__{batch.keys[position]}"
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1546,6 +1592,61 @@ class PPOTrainer(ABC):
             metrics.update(kl_metrics)
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+
+        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+            scores = data.batch["token_level_rewards"].sum(dim=-1).to(torch.float64)
+            weights = data.batch["score_grad_norm_sq"].reshape(-1).to(torch.float64)
+            uids = data.non_tensor_batch["uid"]
+            non_padding_positions = [
+                position for position, tag in enumerate(batch.tags) if not tag.get("is_padding", False)
+            ]
+            group_positions: dict[object, list[int]] = defaultdict(list)
+            for position in non_padding_positions:
+                group_positions[uids[position]].append(position)
+
+            effective_sample_sizes = []
+            baseline_shifts = []
+            grpo_second_moments = []
+            weighted_second_moments = []
+            for positions in group_positions.values():
+                group_weights = weights[positions]
+                group_scores = scores[positions]
+                weight_sum = group_weights.sum()
+                if len(positions) < 2 or weight_sum <= 0:
+                    continue
+
+                effective_sample_sizes.append(
+                    (weight_sum.square() / group_weights.square().sum().clamp_min(1e-12)).item()
+                )
+                grpo_baseline = group_scores.mean()
+                weighted_baseline = (group_weights * group_scores).sum() / weight_sum
+                baseline_shifts.append((weighted_baseline - grpo_baseline).abs().item())
+
+                # Both algorithms retain GRPO's reward-std normalization. Since
+                # this divisor is shared within a prompt group, the weighted
+                # baseline still minimizes this exact empirical second moment.
+                reward_std = group_scores.std()
+                normalization = reward_std + 1e-6 if self.config.algorithm.norm_adv_by_std_in_grpo else 1.0
+                grpo_advantages = (group_scores - grpo_baseline) / normalization
+                weighted_advantages = (group_scores - weighted_baseline) / normalization
+                grpo_second_moments.extend((group_weights * grpo_advantages.square()).tolist())
+                weighted_second_moments.extend((group_weights * weighted_advantages.square()).tolist())
+
+            if effective_sample_sizes:
+                grpo_second_moment = float(np.mean(grpo_second_moments))
+                weighted_second_moment = float(np.mean(weighted_second_moments))
+                second_moment_ratio = weighted_second_moment / max(grpo_second_moment, 1e-12)
+                metrics.update(
+                    {
+                        "gradient_norm_baseline/ess_mean": float(np.mean(effective_sample_sizes)),
+                        "gradient_norm_baseline/ess_min": float(np.min(effective_sample_sizes)),
+                        "gradient_norm_baseline/abs_shift_from_mean": float(np.mean(baseline_shifts)),
+                        "gradient_norm_baseline/exact_second_moment_grpo": grpo_second_moment,
+                        "gradient_norm_baseline/exact_second_moment_weighted": weighted_second_moment,
+                        "gradient_norm_baseline/exact_second_moment_ratio": second_moment_ratio,
+                        "gradient_norm_baseline/exact_second_moment_reduction": 1.0 - second_moment_ratio,
+                    }
+                )
 
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)

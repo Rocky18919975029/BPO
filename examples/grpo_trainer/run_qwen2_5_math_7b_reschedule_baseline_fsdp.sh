@@ -12,6 +12,7 @@
 set -xeuo pipefail
 
 MODE=${MODE:-train}
+ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
 
 PROJECT_NAME=${PROJECT_NAME:-grpo_dapo_math17k_reschedule_baseline}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-Math-7B}
@@ -72,7 +73,7 @@ SAVE_FREQ=${SAVE_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 
 COMMON_DATA=(
-    algorithm.adv_estimator=grpo
+    algorithm.adv_estimator=${ADV_ESTIMATOR}
     algorithm.use_kl_in_reward=False
     data.train_files="['${TRAIN_FILE}']"
     data.train_batch_size=${TRAIN_BATCH_SIZE}
