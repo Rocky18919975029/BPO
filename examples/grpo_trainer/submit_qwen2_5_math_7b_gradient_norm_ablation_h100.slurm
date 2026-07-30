@@ -13,6 +13,10 @@
 #
 # Start with TOTAL_TRAINING_STEPS=1 for a cluster smoke test. The local
 # development machine is not expected to have a GPU.
+#
+# For rapid code-path checks, set FAST_SMOKE=1. This uses 4 prompts x 2
+# responses, caps responses at 128 tokens, runs one exact-gradient round per
+# rank, and disables validation, checkpoints, W&B, and trajectory dumps.
 
 #SBATCH --job-name=verl-grpo-gn-ablate
 #SBATCH --nodes=1
@@ -28,6 +32,20 @@ set -xeuo pipefail
 
 VERL_WORKDIR=${VERL_WORKDIR:-${SLURM_SUBMIT_DIR}}
 ABLATION_VARIANT=${ABLATION_VARIANT:-gradient_norm}
+FAST_SMOKE=${FAST_SMOKE:-0}
+
+case "${FAST_SMOKE,,}" in
+    0|false|no)
+        FAST_SMOKE=0
+        ;;
+    1|true|yes)
+        FAST_SMOKE=1
+        ;;
+    *)
+        echo "Invalid FAST_SMOKE=${FAST_SMOKE}; expected 0/1, false/true, or no/yes" >&2
+        exit 1
+        ;;
+esac
 
 case "${ABLATION_VARIANT}" in
     grpo)
@@ -121,12 +139,17 @@ export PYTHONUNBUFFERED=1
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-0}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
 export RAY_TMP_DIR=${RAY_TMP_DIR:-${VERL_WORKDIR}/ray_tmp/${SLURM_JOB_ID}}
-export TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","wandb"]'}
+if [ "${FAST_SMOKE}" = 1 ]; then
+    export TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
+    export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+else
+    export TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","wandb"]'}
+    export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+fi
 export WANDB_MODE=${WANDB_MODE:-offline}
 export WANDB_DIR=${WANDB_DIR:-${VERL_WORKDIR}/wandb}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
-export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${HF_HUB_OFFLINE}}
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
 
@@ -135,14 +158,37 @@ mkdir -p "${WANDB_DIR}" "${RAY_TMP_DIR}"
 PROJECT_NAME=${PROJECT_NAME:-${DEFAULT_PROJECT_NAME}}
 RUN_NAME=${RUN_NAME:-${DEFAULT_RUN_PREFIX}_${SLURM_JOB_ID}}
 
-# Matched pilot defaults. Both variants see 8 prompts x 8 responses per step.
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
-ROLLOUT_N=${ROLLOUT_N:-8}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
-LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-20}
-TEST_FREQ=${TEST_FREQ:-5}
+if [ "${FAST_SMOKE}" = 1 ]; then
+    # Eight trajectories keep all eight actor ranks active while preserving a
+    # nontrivial two-response GRPO group.
+    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
+    ROLLOUT_N=${ROLLOUT_N:-2}
+    PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
+    PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-128}
+    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
+    TEST_FREQ=${TEST_FREQ:--1}
+    SAVE_FREQ=${SAVE_FREQ:--1}
+    EXTRA_TRAINING_ARGS=(
+        trainer.rollout_data_dir=null
+        trainer.validation_data_dir=null
+    )
+else
+    # Matched pilot defaults. Both variants see 8 prompts x 8 responses per step.
+    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
+    ROLLOUT_N=${ROLLOUT_N:-8}
+    PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
+    PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
+    TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-20}
+    TEST_FREQ=${TEST_FREQ:-5}
+    SAVE_FREQ=${SAVE_FREQ:-1}
+    EXTRA_TRAINING_ARGS=()
+fi
 
 # Exact no_sync gradients temporarily materialize a full gradient on every
 # rank. Offloading optimizer state and using conservative vLLM placement leave
@@ -153,7 +199,6 @@ REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-True}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.40}
 
 SAVE_CONTENTS=${SAVE_CONTENTS:-"['model','optimizer','extra','hf_model']"}
-SAVE_FREQ=${SAVE_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 
 echo "Job ID: ${SLURM_JOB_ID}"
@@ -162,6 +207,7 @@ echo "Working directory: ${VERL_WORKDIR}"
 echo "Ablation variant: ${ABLATION_VARIANT}"
 echo "Advantage estimator: ${ADV_ESTIMATOR}"
 echo "Training script: ${TRAINING_SCRIPT}"
+echo "Fast smoke mode: ${FAST_SMOKE}"
 echo "Project: ${PROJECT_NAME}"
 echo "Run: ${RUN_NAME}"
 echo "Model: ${MODEL_PATH}"
@@ -169,7 +215,11 @@ echo "Data dir: ${DATA_DIR}"
 echo "Train batch size: ${TRAIN_BATCH_SIZE}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Total trajectories per step: $((TRAIN_BATCH_SIZE * ROLLOUT_N))"
+echo "Max prompt length: ${MAX_PROMPT_LENGTH}"
+echo "Max response length: ${MAX_RESPONSE_LENGTH}"
 echo "Training steps: ${TOTAL_TRAINING_STEPS}"
+echo "Validation frequency: ${TEST_FREQ}"
+echo "Checkpoint frequency: ${SAVE_FREQ}"
 echo "Rollout seed: ${ROLLOUT_SEED:-42}"
 echo "Checkpoint contents: ${SAVE_CONTENTS}"
 echo "Resume mode: ${RESUME_MODE}"
@@ -189,6 +239,8 @@ ROLLOUT_N="${ROLLOUT_N}" \
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE}" \
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH}" \
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH}" \
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD}" \
 ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD}" \
 REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD}" \
@@ -201,4 +253,4 @@ SAVE_FREQ="${SAVE_FREQ}" \
 RESUME_MODE="${RESUME_MODE}" \
 NNODES=1 \
 NGPUS_PER_NODE=8 \
-bash "${TRAINING_SCRIPT}" "$@"
+bash "${TRAINING_SCRIPT}" "${EXTRA_TRAINING_ARGS[@]}" "$@"
