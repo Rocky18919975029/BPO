@@ -19,6 +19,7 @@ import platform
 import signal
 import threading
 from collections.abc import Mapping
+from inspect import Parameter, signature
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
@@ -375,15 +376,35 @@ class vLLMColocateWorkerExtension:
 
         # Platform workers without the layerwise reload API (e.g. vllm-ascend's
         # NPUWorker) fall back to bucketed load_weights.
-        if not callable(getattr(self, "reload_weights", None)):
+        reload_weights = getattr(self, "reload_weights", None)
+        if not callable(reload_weights):
             return False
+
+        # reload_weights exists in multiple vLLM releases with incompatible
+        # signatures. Only the layerwise variant accepts a weights iterator;
+        # older variants take no arguments and must use the bucketed fallback.
+        try:
+            reload_parameters = signature(reload_weights).parameters
+        except (TypeError, ValueError):
+            logger.warning("Unable to inspect vLLM reload_weights; falling back to bucketed weight loading")
+            return False
+
+        accepts_kwargs = any(parameter.kind == Parameter.VAR_KEYWORD for parameter in reload_parameters.values())
+        if "weights_iterator" not in reload_parameters and not accepts_kwargs:
+            logger.warning(
+                "vLLM reload_weights does not accept weights_iterator; falling back to bucketed weight loading"
+            )
+            return False
+
+        reload_kwargs = {
+            "weights_iterator": self._iter_normalized_base_sync_weights(receiver.iter_weights(), clone_tensors=True)
+        }
+        if "is_checkpoint_format" in reload_parameters or accepts_kwargs:
+            reload_kwargs["is_checkpoint_format"] = True
 
         logger.info("Loading standard weights via vLLM reload_weights (async)")
         with set_current_vllm_config(self.model_runner.vllm_config):
-            self.reload_weights(
-                weights_iterator=self._iter_normalized_base_sync_weights(receiver.iter_weights(), clone_tensors=True),
-                is_checkpoint_format=True,
-            )
+            reload_weights(**reload_kwargs)
         return True
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):

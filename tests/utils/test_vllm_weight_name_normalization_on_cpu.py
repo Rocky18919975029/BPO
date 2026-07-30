@@ -182,6 +182,44 @@ def test_maybe_reload_standard_weights_falls_back_without_reload_api():
     assert worker._maybe_reload_standard_weights_from_ipc(_UnusedReceiver()) is False
 
 
+def test_maybe_reload_standard_weights_falls_back_for_legacy_reload_signature():
+    """Older vLLM workers expose reload_weights() but cannot consume an iterator."""
+
+    class _UnusedReceiver:
+        def iter_weights(self):
+            raise AssertionError("legacy fallback must not consume the streaming receiver")
+
+    worker = _make_worker(_FakeModel())
+    worker.model_runner.vllm_config = SimpleNamespace(speculative_config=None)
+
+    def _legacy_reload_weights():
+        raise AssertionError("legacy reload_weights must not be called")
+
+    worker.reload_weights = _legacy_reload_weights
+
+    assert worker._maybe_reload_standard_weights_from_ipc(_UnusedReceiver()) is False
+
+
+def test_maybe_reload_standard_weights_supports_iterator_without_checkpoint_flag():
+    class _Receiver:
+        def iter_weights(self):
+            yield ("model.language_model.layers.0.self_attn.q_proj.weight", torch.ones(1))
+
+    worker = _make_worker(_FakeModel())
+    worker.model_runner.vllm_config = SimpleNamespace(speculative_config=None)
+    reloaded_weights = []
+
+    def _reload_weights(*, weights_iterator):
+        reloaded_weights.extend(weights_iterator)
+
+    worker.reload_weights = _reload_weights
+
+    assert worker._maybe_reload_standard_weights_from_ipc(_Receiver()) is True
+    assert [name for name, _ in reloaded_weights] == [
+        "model.language_model.layers.0.self_attn.q_proj.base_layer.weight"
+    ]
+
+
 def test_update_weights_normalizes_base_layer_names_before_fp8(monkeypatch):
     import verl.workers.rollout.vllm_rollout.utils as worker_utils
 
