@@ -44,6 +44,18 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def apply_prompt_sampling_overrides(prompt: dict[str, Any], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    """Apply internal per-prompt sampling overrides without leaking them into trajectory fields."""
+    run_sampling_params = dict(sampling_params)
+    temperature = prompt.pop("__temperature__", None)
+    if temperature is not None:
+        temperature = float(temperature)
+        if temperature <= 0:
+            raise ValueError(f"__temperature__ must be positive, got {temperature}")
+        run_sampling_params["temperature"] = temperature
+    return run_sampling_params
+
+
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
@@ -109,7 +121,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
             do_sample = prompt.pop("__do_sample__", True)
 
-            run_sampling_params = dict(sampling_params)
+            run_sampling_params = apply_prompt_sampling_overrides(prompt, sampling_params)
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
 

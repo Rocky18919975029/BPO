@@ -136,7 +136,13 @@ class TaskRunnerV1:
 
         from verl.trainer.ppo.v1 import get_trainer_cls
 
-        trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
+        temperature_experiment = config.get("temperature_variance_experiment", None)
+        if temperature_experiment is not None and temperature_experiment.get("enabled", False):
+            from verl.trainer.ppo.v1.trainer_temperature_variance import PPOTrainerTemperatureVariance
+
+            trainer_cls = PPOTrainerTemperatureVariance
+        else:
+            trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
 
         config.transfer_queue.enable = True
         pprint(OmegaConf.to_container(config, resolve=True))
