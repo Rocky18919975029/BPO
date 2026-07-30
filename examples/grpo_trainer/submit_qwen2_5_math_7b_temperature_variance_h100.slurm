@@ -113,6 +113,18 @@ REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-True}
 BOOTSTRAP_SAMPLES=${BOOTSTRAP_SAMPLES:-1000}
 RUN_NAME=${RUN_NAME:-qwen2_5_math_7b_temperature_variance_${SLURM_JOB_ID}}
 EXPERIMENT_OUTPUT_DIR=${EXPERIMENT_OUTPUT_DIR:-${VERL_WORKDIR}/temperature_variance_results/${RUN_NAME}}
+TEMPERATURE_COUNT=$(
+    python - "${TEMPERATURES}" <<'PY'
+import ast
+import sys
+
+temperatures = ast.literal_eval(sys.argv[1])
+if not isinstance(temperatures, list):
+    raise SystemExit("TEMPERATURES must be a Python/Hydra list")
+print(len(temperatures))
+PY
+)
+CONDITION_COUNT=$((TEMPERATURE_COUNT + 1))
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Working directory: ${VERL_WORKDIR}"
@@ -121,7 +133,8 @@ echo "Train file: ${TRAIN_FILE}"
 echo "Problems: ${TRAIN_BATCH_SIZE}"
 echo "Responses per problem and condition: ${ROLLOUT_N}"
 echo "Temperatures: ${TEMPERATURES}"
-echo "Total generated responses: $((TRAIN_BATCH_SIZE * ROLLOUT_N * 8)) for the default seven-temperature grid"
+echo "Conditions: ${CONDITION_COUNT} (one pilot plus ${TEMPERATURE_COUNT} direct)"
+echo "Total generated responses: $((TRAIN_BATCH_SIZE * ROLLOUT_N * CONDITION_COUNT))"
 echo "Results: ${EXPERIMENT_OUTPUT_DIR}"
 
 MODEL_PATH="${MODEL_PATH}" \
