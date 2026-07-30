@@ -1,9 +1,9 @@
 #!/bin/bash
 # Matched 8xH100 comparison with four available baseline modes:
 #   grpo: ordinary full-group reward mean
-#   grpo_loo: ordinary leave-one-out reward mean
+#   grpo_loo: strict ordinary leave-one-out reward mean (no reward std)
 #   gradient_norm: full-group exact gradient-norm-weighted reward mean
-#   gradient_norm_loo: exact gradient-norm-weighted leave-one-out reward mean
+#   gradient_norm_loo: strict exact gradient-norm-weighted LOO mean (no reward std)
 #
 # Submit two jobs with identical model/data paths and seeds:
 #
@@ -57,24 +57,28 @@ case "${ABLATION_VARIANT}" in
         ADV_ESTIMATOR=grpo
         DEFAULT_PROJECT_NAME=grpo_exact_norm_ablation
         DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_control
+        ADVANTAGE_ARGS=()
         ;;
     grpo_loo)
         TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_reschedule_baseline_fsdp.sh
         ADV_ESTIMATOR=grpo_loo
         DEFAULT_PROJECT_NAME=grpo_exact_norm_loo_ablation
-        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_loo_control
+        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_strict_loo_control
+        ADVANTAGE_ARGS=(algorithm.norm_adv_by_std_in_grpo=False)
         ;;
     gradient_norm)
         TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_gradient_norm_baseline_exact_fsdp.sh
         ADV_ESTIMATOR=grpo_gradient_norm
         DEFAULT_PROJECT_NAME=grpo_exact_norm_ablation
         DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_gradient_norm_exact
+        ADVANTAGE_ARGS=()
         ;;
     gradient_norm_loo)
         TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_gradient_norm_baseline_exact_fsdp.sh
         ADV_ESTIMATOR=grpo_gradient_norm_loo
         DEFAULT_PROJECT_NAME=grpo_exact_norm_loo_ablation
-        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_gradient_norm_loo_exact
+        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_gradient_norm_strict_loo_exact
+        ADVANTAGE_ARGS=(algorithm.norm_adv_by_std_in_grpo=False)
         ;;
     *)
         echo "Unknown ABLATION_VARIANT=${ABLATION_VARIANT}; expected grpo, grpo_loo, gradient_norm, or gradient_norm_loo" >&2
@@ -222,6 +226,7 @@ echo "Node list: ${SLURM_JOB_NODELIST}"
 echo "Working directory: ${VERL_WORKDIR}"
 echo "Ablation variant: ${ABLATION_VARIANT}"
 echo "Advantage estimator: ${ADV_ESTIMATOR}"
+echo "Strict LOO: $([[ ${ABLATION_VARIANT} == *_loo ]] && echo true || echo false)"
 echo "Training script: ${TRAINING_SCRIPT}"
 echo "Fast smoke mode: ${FAST_SMOKE}"
 echo "Project: ${PROJECT_NAME}"
@@ -269,4 +274,4 @@ SAVE_FREQ="${SAVE_FREQ}" \
 RESUME_MODE="${RESUME_MODE}" \
 NNODES=1 \
 NGPUS_PER_NODE=8 \
-bash "${TRAINING_SCRIPT}" "${EXTRA_TRAINING_ARGS[@]}" "$@"
+bash "${TRAINING_SCRIPT}" "${EXTRA_TRAINING_ARGS[@]}" "${ADVANTAGE_ARGS[@]}" "$@"

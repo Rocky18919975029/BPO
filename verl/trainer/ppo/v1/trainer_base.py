@@ -1642,10 +1642,11 @@ class PPOTrainer(ABC):
                 if len(positions) < 2 or weight_sum <= 0:
                     continue
 
-                reward_std = group_scores.std()
-                normalization = reward_std + 1e-6 if self.config.algorithm.norm_adv_by_std_in_grpo else 1.0
-
                 if is_gradient_norm_loo:
+                    # Strict LOO uses no reward-std normalization: the current
+                    # response must not affect any multiplier applied to its
+                    # centered reward.
+                    normalization = 1.0
                     held_out_weight_sums = weight_sum - group_weights
                     held_out_weight_squares = group_weights.square().sum() - group_weights.square()
                     ordinary_baselines = (group_scores.sum() - group_scores) / (len(positions) - 1)
@@ -1664,6 +1665,8 @@ class PPOTrainer(ABC):
                     )
                     baseline_shifts.extend((weighted_baselines - ordinary_baselines).abs().tolist())
                 else:
+                    reward_std = group_scores.std()
+                    normalization = reward_std + 1e-6 if self.config.algorithm.norm_adv_by_std_in_grpo else 1.0
                     effective_sample_sizes.append(
                         (weight_sum.square() / group_weights.square().sum().clamp_min(1e-12)).item()
                     )
@@ -1671,9 +1674,10 @@ class PPOTrainer(ABC):
                     weighted_baselines = (group_weights * group_scores).sum() / weight_sum
                     baseline_shifts.append((weighted_baselines - ordinary_baselines).abs().item())
 
-                # Both estimators retain GRPO's full-group reward-std
-                # normalization. In LOO mode the two baselines are computed
-                # separately for every held-out response.
+                # In strict LOO mode the two baselines are computed separately
+                # for every held-out response and no reward-std normalization
+                # is applied. Full-group mode retains the configured GRPO
+                # normalization behavior.
                 grpo_advantages = (group_scores - ordinary_baselines) / normalization
                 weighted_advantages = (group_scores - weighted_baselines) / normalization
                 grpo_second_moments.extend((group_weights * grpo_advantages.square()).tolist())

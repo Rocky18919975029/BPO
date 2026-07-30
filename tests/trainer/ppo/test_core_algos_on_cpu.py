@@ -358,7 +358,8 @@ def test_gradient_norm_grpo_rejects_invalid_weights(invalid_weights: torch.Tenso
         )
 
 
-def test_grpo_loo_excludes_current_response_reward():
+@pytest.mark.parametrize("norm_adv_by_std_in_grpo", [False, True])
+def test_grpo_loo_is_strict_and_excludes_current_response_reward(norm_adv_by_std_in_grpo: bool):
     token_level_rewards = torch.tensor([[0.0], [2.0], [4.0]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)
     index = np.array(["prompt-a"] * 3, dtype=object)
@@ -367,7 +368,7 @@ def test_grpo_loo_excludes_current_response_reward():
         token_level_rewards=token_level_rewards,
         response_mask=response_mask,
         index=index,
-        norm_adv_by_std_in_grpo=False,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
     )
 
     # LOO baselines are [3, 2, 1], respectively.
@@ -376,7 +377,8 @@ def test_grpo_loo_excludes_current_response_reward():
     assert torch.equal(returns, expected)
 
 
-def test_gradient_norm_grpo_loo_uses_only_other_responses():
+@pytest.mark.parametrize("norm_adv_by_std_in_grpo", [False, True])
+def test_gradient_norm_grpo_loo_is_strict_and_uses_only_other_responses(norm_adv_by_std_in_grpo: bool):
     token_level_rewards = torch.tensor([[0.0], [2.0], [4.0]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)
     index = np.array(["prompt-a"] * 3, dtype=object)
@@ -387,7 +389,7 @@ def test_gradient_norm_grpo_loo_uses_only_other_responses():
         response_mask=response_mask,
         index=index,
         score_grad_norm_sq=score_grad_norm_sq,
-        norm_adv_by_std_in_grpo=False,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
     )
 
     expected = torch.tensor([[-10.0 / 3.0], [-10.0 / 7.0], [2.5]], dtype=torch.float32)

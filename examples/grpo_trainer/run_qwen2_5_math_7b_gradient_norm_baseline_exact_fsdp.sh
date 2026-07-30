@@ -3,12 +3,12 @@
 #
 # Supported estimators:
 #   grpo_gradient_norm: full-group weighted baseline
-#   grpo_gradient_norm_loo: leave-one-out weighted baseline
+#   grpo_gradient_norm_loo: strict leave-one-out weighted baseline (no reward std)
 #
 # Exact-norm ablation:
 #   1. Compute ||grad_theta log pi_theta(response | prompt)||^2 exactly for
 #      every prompt-response pair with a separate FSDP1 backward pass.
-#   2. Construct the requested full-group or leave-one-out weighted baseline.
+#   2. Construct the requested full-group or strict leave-one-out weighted baseline.
 #   3. Keep every other setting from the GRPO baseline unchanged.
 #
 # Exact sensing is expensive. The defaults below form a 64-trajectory pilot

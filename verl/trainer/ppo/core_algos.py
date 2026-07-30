@@ -343,16 +343,19 @@ def compute_grpo_loo_outcome_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute GRPO advantages using an ordinary leave-one-out reward baseline.
+    """Compute strict RLOO advantages using an ordinary held-out reward baseline.
 
     For response ``i`` in a prompt group of size ``n > 1``, the baseline is
 
     ``b_{-i} = sum_{j != i} r_j / (n - 1)``.
 
-    The existing GRPO full-group reward standard deviation is retained so the
-    experiment isolates the effect of changing the baseline.
+    No reward-standard-deviation normalization is applied. In particular,
+    response ``i`` affects neither its baseline nor any normalization factor
+    multiplying its centered reward. ``norm_adv_by_std_in_grpo`` remains in
+    the signature for compatibility with the shared advantage API, but strict
+    RLOO deliberately ignores it.
     """
-    del config
+    del config, epsilon, norm_adv_by_std_in_grpo
 
     scores = token_level_rewards.sum(dim=-1)
     if len(index) != scores.numel():
@@ -368,14 +371,10 @@ def compute_grpo_loo_outcome_advantage(
             group_scores = scores[positions]
             if len(positions) == 1:
                 centered = group_scores
-                reward_std = scores.new_tensor(1.0)
             else:
                 loo_baselines = (group_scores.sum() - group_scores) / (len(positions) - 1)
                 centered = group_scores - loo_baselines
-                reward_std = torch.std(group_scores)
 
-            if norm_adv_by_std_in_grpo:
-                centered = centered / (reward_std + epsilon)
             scalar_advantages[positions] = centered
 
         advantages = scalar_advantages.unsqueeze(-1) * response_mask
@@ -478,10 +477,15 @@ def compute_grpo_gradient_norm_loo_outcome_advantage(
     ``b_{-i} = sum_{j != i} ||g_j||^2 r_j / sum_{j != i} ||g_j||^2``.
 
     Neither the reward nor the score-gradient norm of response ``i`` enters its
-    baseline. If every held-out weight is zero, the ordinary LOO reward mean is
-    used as the well-defined fallback.
+    baseline. No reward-standard-deviation normalization is applied, so the
+    complete advantage multiplier is independent of response ``i`` apart from
+    its own centered reward. If every held-out weight is zero, the ordinary LOO
+    reward mean is used as the well-defined fallback.
+
+    ``norm_adv_by_std_in_grpo`` remains in the signature for compatibility with
+    the shared advantage API, but strict weighted RLOO deliberately ignores it.
     """
-    del config
+    del config, norm_adv_by_std_in_grpo
 
     scores = token_level_rewards.sum(dim=-1)
     if len(index) != scores.numel():
@@ -507,7 +511,6 @@ def compute_grpo_gradient_norm_loo_outcome_advantage(
             group_scores = scores[positions]
             if len(positions) == 1:
                 centered = group_scores
-                reward_std = scores.new_tensor(1.0)
             else:
                 group_scores_fp64 = group_scores.to(torch.float64)
                 group_weights = weights[positions]
@@ -522,10 +525,7 @@ def compute_grpo_gradient_norm_loo_outcome_advantage(
                     ordinary_loo_baselines,
                 ).to(group_scores.dtype)
                 centered = group_scores - weighted_loo_baselines
-                reward_std = torch.std(group_scores)
 
-            if norm_adv_by_std_in_grpo:
-                centered = centered / (reward_std + epsilon)
             scalar_advantages[positions] = centered
 
         advantages = scalar_advantages.unsqueeze(-1) * response_mask
