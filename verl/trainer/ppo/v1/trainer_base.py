@@ -508,7 +508,10 @@ class PPOTrainer(ABC):
                 batch = self._compute_values(batch, metrics=metrics)
 
         # 7. [OPTIONAL] compute exact reward-free score-gradient norms
-        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+        if self.config.algorithm.adv_estimator in (
+            core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM,
+            core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+        ):
             with marked_timer("exact_gradient_norm", timing_raw, color="purple"):
                 batch = self._compute_exact_gradient_norm(batch, metrics=metrics)
 
@@ -1155,11 +1158,20 @@ class PPOTrainer(ABC):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            is_gradient_norm_estimator = self.config.algorithm.adv_estimator in (
+                core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM,
+                core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+            )
+            if is_gradient_norm_estimator:
+                fields.append("score_grad_norm_sq")
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
             uids = data.pop("uid").tolist()
+            score_grad_norm_sq = (
+                data.pop("score_grad_norm_sq").reshape(-1).tolist() if is_gradient_norm_estimator else None
+            )
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             scores = data["rm_scores"].sum(dim=1).tolist()
@@ -1186,6 +1198,8 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            if score_grad_norm_sq is not None:
+                reward_extra_infos_dict["score_grad_norm_sq"] = [score_grad_norm_sq[i] for i in sorted_indices]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1567,8 +1581,21 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        gradient_norm_estimators = (
+            core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM,
+            core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+        )
+        group_relative_loo_estimators = (
+            core_algos.AdvantageEstimator.GRPO_LOO,
+            core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+        )
+        is_gradient_norm_estimator = self.config.algorithm.adv_estimator in gradient_norm_estimators
+        is_gradient_norm_loo = (
+            self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO
+        )
+
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
-        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+        if is_gradient_norm_estimator:
             fields.append("score_grad_norm_sq")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
@@ -1576,7 +1603,7 @@ class PPOTrainer(ABC):
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
-        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+        if self.config.algorithm.adv_estimator in group_relative_loo_estimators or is_gradient_norm_estimator:
             # Synthetic balancing rows inherit a real UID as a metadata
             # template. Give each one a unique singleton group so its zero
             # reward/gradient cannot alter a real prompt's baseline or std.
@@ -1593,7 +1620,7 @@ class PPOTrainer(ABC):
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
 
-        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM:
+        if is_gradient_norm_estimator:
             scores = data.batch["token_level_rewards"].sum(dim=-1).to(torch.float64)
             weights = data.batch["score_grad_norm_sq"].reshape(-1).to(torch.float64)
             uids = data.non_tensor_batch["uid"]
@@ -1615,20 +1642,40 @@ class PPOTrainer(ABC):
                 if len(positions) < 2 or weight_sum <= 0:
                     continue
 
-                effective_sample_sizes.append(
-                    (weight_sum.square() / group_weights.square().sum().clamp_min(1e-12)).item()
-                )
-                grpo_baseline = group_scores.mean()
-                weighted_baseline = (group_weights * group_scores).sum() / weight_sum
-                baseline_shifts.append((weighted_baseline - grpo_baseline).abs().item())
-
-                # Both algorithms retain GRPO's reward-std normalization. Since
-                # this divisor is shared within a prompt group, the weighted
-                # baseline still minimizes this exact empirical second moment.
                 reward_std = group_scores.std()
                 normalization = reward_std + 1e-6 if self.config.algorithm.norm_adv_by_std_in_grpo else 1.0
-                grpo_advantages = (group_scores - grpo_baseline) / normalization
-                weighted_advantages = (group_scores - weighted_baseline) / normalization
+
+                if is_gradient_norm_loo:
+                    held_out_weight_sums = weight_sum - group_weights
+                    held_out_weight_squares = group_weights.square().sum() - group_weights.square()
+                    ordinary_baselines = (group_scores.sum() - group_scores) / (len(positions) - 1)
+                    weighted_reward_sum = (group_weights * group_scores).sum()
+                    weighted_baselines = torch.where(
+                        held_out_weight_sums > 0,
+                        (weighted_reward_sum - group_weights * group_scores) / held_out_weight_sums.clamp_min(1e-12),
+                        ordinary_baselines,
+                    )
+                    valid_ess = held_out_weight_sums > 0
+                    effective_sample_sizes.extend(
+                        (
+                            held_out_weight_sums[valid_ess].square()
+                            / held_out_weight_squares[valid_ess].clamp_min(1e-12)
+                        ).tolist()
+                    )
+                    baseline_shifts.extend((weighted_baselines - ordinary_baselines).abs().tolist())
+                else:
+                    effective_sample_sizes.append(
+                        (weight_sum.square() / group_weights.square().sum().clamp_min(1e-12)).item()
+                    )
+                    ordinary_baselines = group_scores.mean()
+                    weighted_baselines = (group_weights * group_scores).sum() / weight_sum
+                    baseline_shifts.append((weighted_baselines - ordinary_baselines).abs().item())
+
+                # Both estimators retain GRPO's full-group reward-std
+                # normalization. In LOO mode the two baselines are computed
+                # separately for every held-out response.
+                grpo_advantages = (group_scores - ordinary_baselines) / normalization
+                weighted_advantages = (group_scores - weighted_baselines) / normalization
                 grpo_second_moments.extend((group_weights * grpo_advantages.square()).tolist())
                 weighted_second_moments.extend((group_weights * weighted_advantages.square()).tolist())
 
@@ -1645,6 +1692,7 @@ class PPOTrainer(ABC):
                         "gradient_norm_baseline/exact_second_moment_weighted": weighted_second_moment,
                         "gradient_norm_baseline/exact_second_moment_ratio": second_moment_ratio,
                         "gradient_norm_baseline/exact_second_moment_reduction": 1.0 - second_moment_ratio,
+                        "gradient_norm_baseline/is_loo": float(is_gradient_norm_loo),
                     }
                 )
 

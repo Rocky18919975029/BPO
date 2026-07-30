@@ -22,7 +22,9 @@ import torch
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
+    compute_grpo_gradient_norm_loo_outcome_advantage,
     compute_grpo_gradient_norm_outcome_advantage,
+    compute_grpo_loo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
@@ -342,14 +344,123 @@ def test_gradient_norm_baseline_minimizes_empirical_second_moment():
         (torch.tensor([1.0, torch.inf]), "NaN or infinity"),
     ],
 )
-def test_gradient_norm_grpo_rejects_invalid_weights(invalid_weights: torch.Tensor, error_match: str):
+@pytest.mark.parametrize(
+    "advantage_fn",
+    [compute_grpo_gradient_norm_outcome_advantage, compute_grpo_gradient_norm_loo_outcome_advantage],
+)
+def test_gradient_norm_grpo_rejects_invalid_weights(invalid_weights: torch.Tensor, error_match: str, advantage_fn):
     with pytest.raises(ValueError, match=error_match):
-        compute_grpo_gradient_norm_outcome_advantage(
+        advantage_fn(
             token_level_rewards=torch.tensor([[0.0], [1.0]]),
             response_mask=torch.ones(2, 1),
             index=np.array(["prompt-a", "prompt-a"], dtype=object),
             score_grad_norm_sq=invalid_weights,
         )
+
+
+def test_grpo_loo_excludes_current_response_reward():
+    token_level_rewards = torch.tensor([[0.0], [2.0], [4.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt-a"] * 3, dtype=object)
+
+    advantages, returns = compute_grpo_loo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    # LOO baselines are [3, 2, 1], respectively.
+    expected = torch.tensor([[-3.0], [0.0], [3.0]], dtype=torch.float32)
+    assert torch.equal(advantages, expected)
+    assert torch.equal(returns, expected)
+
+
+def test_gradient_norm_grpo_loo_uses_only_other_responses():
+    token_level_rewards = torch.tensor([[0.0], [2.0], [4.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt-a"] * 3, dtype=object)
+    score_grad_norm_sq = torch.tensor([1.0, 3.0, 6.0], dtype=torch.float64)
+
+    advantages, returns = compute_grpo_gradient_norm_loo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        score_grad_norm_sq=score_grad_norm_sq,
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    expected = torch.tensor([[-10.0 / 3.0], [-10.0 / 7.0], [2.5]], dtype=torch.float32)
+    assert torch.allclose(advantages, expected)
+    assert torch.allclose(returns, expected)
+
+
+def test_gradient_norm_grpo_loo_equal_weights_matches_grpo_loo():
+    token_level_rewards = torch.tensor([[1.0], [2.0], [5.0], [-1.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
+
+    loo_advantages, loo_returns = compute_grpo_loo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    weighted_advantages, weighted_returns = compute_grpo_gradient_norm_loo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        score_grad_norm_sq=torch.ones(4, dtype=torch.float64),
+    )
+
+    assert torch.allclose(weighted_advantages, loo_advantages)
+    assert torch.allclose(weighted_returns, loo_returns)
+
+
+def test_gradient_norm_grpo_loo_zero_held_out_weight_falls_back_to_ordinary_loo():
+    rewards = torch.tensor([[1.0], [5.0]], dtype=torch.float32)
+    mask = torch.ones_like(rewards)
+    index = np.array(["prompt-a", "prompt-a"], dtype=object)
+
+    ordinary, _ = compute_grpo_loo_outcome_advantage(
+        token_level_rewards=rewards,
+        response_mask=mask,
+        index=index,
+        norm_adv_by_std_in_grpo=False,
+    )
+    weighted, _ = compute_grpo_gradient_norm_loo_outcome_advantage(
+        token_level_rewards=rewards,
+        response_mask=mask,
+        index=index,
+        score_grad_norm_sq=torch.tensor([1.0, 0.0]),
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    assert torch.equal(weighted, ordinary)
+
+
+def test_gradient_norm_grpo_loo_baseline_is_independent_of_current_pair():
+    rewards = torch.tensor([[1.0], [3.0], [7.0]], dtype=torch.float32)
+    mask = torch.ones_like(rewards)
+    index = np.array(["prompt-a"] * 3, dtype=object)
+
+    original, _ = compute_grpo_gradient_norm_loo_outcome_advantage(
+        token_level_rewards=rewards,
+        response_mask=mask,
+        index=index,
+        score_grad_norm_sq=torch.tensor([2.0, 5.0, 11.0]),
+        norm_adv_by_std_in_grpo=False,
+    )
+    perturbed, _ = compute_grpo_gradient_norm_loo_outcome_advantage(
+        token_level_rewards=torch.tensor([[101.0], [3.0], [7.0]]),
+        response_mask=mask,
+        index=index,
+        score_grad_norm_sq=torch.tensor([2000.0, 5.0, 11.0]),
+        norm_adv_by_std_in_grpo=False,
+    )
+
+    original_baseline = rewards[0, 0] - original[0, 0]
+    perturbed_baseline = 101.0 - perturbed[0, 0]
+    assert torch.allclose(original_baseline, perturbed_baseline)
 
 
 @pytest.mark.parametrize(

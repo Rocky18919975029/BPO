@@ -1,5 +1,9 @@
 #!/bin/bash
-# Matched 8xH100 comparison: ordinary GRPO vs exact gradient-norm baseline.
+# Matched 8xH100 comparison with four available baseline modes:
+#   grpo: ordinary full-group reward mean
+#   grpo_loo: ordinary leave-one-out reward mean
+#   gradient_norm: full-group exact gradient-norm-weighted reward mean
+#   gradient_norm_loo: exact gradient-norm-weighted leave-one-out reward mean
 #
 # Submit two jobs with identical model/data paths and seeds:
 #
@@ -54,14 +58,26 @@ case "${ABLATION_VARIANT}" in
         DEFAULT_PROJECT_NAME=grpo_exact_norm_ablation
         DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_control
         ;;
+    grpo_loo)
+        TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_reschedule_baseline_fsdp.sh
+        ADV_ESTIMATOR=grpo_loo
+        DEFAULT_PROJECT_NAME=grpo_exact_norm_loo_ablation
+        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_loo_control
+        ;;
     gradient_norm)
         TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_gradient_norm_baseline_exact_fsdp.sh
         ADV_ESTIMATOR=grpo_gradient_norm
         DEFAULT_PROJECT_NAME=grpo_exact_norm_ablation
         DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_gradient_norm_exact
         ;;
+    gradient_norm_loo)
+        TRAINING_SCRIPT=examples/grpo_trainer/run_qwen2_5_math_7b_gradient_norm_baseline_exact_fsdp.sh
+        ADV_ESTIMATOR=grpo_gradient_norm_loo
+        DEFAULT_PROJECT_NAME=grpo_exact_norm_loo_ablation
+        DEFAULT_RUN_PREFIX=qwen2_5_math_7b_grpo_gradient_norm_loo_exact
+        ;;
     *)
-        echo "Unknown ABLATION_VARIANT=${ABLATION_VARIANT}; expected grpo or gradient_norm" >&2
+        echo "Unknown ABLATION_VARIANT=${ABLATION_VARIANT}; expected grpo, grpo_loo, gradient_norm, or gradient_norm_loo" >&2
         exit 1
         ;;
 esac

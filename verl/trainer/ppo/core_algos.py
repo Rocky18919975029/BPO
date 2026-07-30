@@ -105,7 +105,9 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GRPO_LOO = "grpo_loo"
     GRPO_GRADIENT_NORM = "grpo_gradient_norm"
+    GRPO_GRADIENT_NORM_LOO = "grpo_gradient_norm_loo"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
@@ -332,6 +334,55 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
+@register_adv_est(AdvantageEstimator.GRPO_LOO)
+def compute_grpo_loo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GRPO advantages using an ordinary leave-one-out reward baseline.
+
+    For response ``i`` in a prompt group of size ``n > 1``, the baseline is
+
+    ``b_{-i} = sum_{j != i} r_j / (n - 1)``.
+
+    The existing GRPO full-group reward standard deviation is retained so the
+    experiment isolates the effect of changing the baseline.
+    """
+    del config
+
+    scores = token_level_rewards.sum(dim=-1)
+    if len(index) != scores.numel():
+        raise ValueError(f"index must contain one prompt id per response: got {len(index)} for {scores.numel()}")
+
+    id2positions = defaultdict(list)
+    with torch.no_grad():
+        for position, prompt_id in enumerate(index):
+            id2positions[prompt_id].append(position)
+
+        scalar_advantages = torch.empty_like(scores)
+        for positions in id2positions.values():
+            group_scores = scores[positions]
+            if len(positions) == 1:
+                centered = group_scores
+                reward_std = scores.new_tensor(1.0)
+            else:
+                loo_baselines = (group_scores.sum() - group_scores) / (len(positions) - 1)
+                centered = group_scores - loo_baselines
+                reward_std = torch.std(group_scores)
+
+            if norm_adv_by_std_in_grpo:
+                centered = centered / (reward_std + epsilon)
+            scalar_advantages[positions] = centered
+
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
+
+
 @register_adv_est(AdvantageEstimator.GRPO_GRADIENT_NORM)
 def compute_grpo_gradient_norm_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -401,6 +452,78 @@ def compute_grpo_gradient_norm_outcome_advantage(
                 reward_std = torch.std(group_scores)
 
             centered = scores[positions] - baseline
+            if norm_adv_by_std_in_grpo:
+                centered = centered / (reward_std + epsilon)
+            scalar_advantages[positions] = centered
+
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GRPO_GRADIENT_NORM_LOO)
+def compute_grpo_gradient_norm_loo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    score_grad_norm_sq: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GRPO advantages with a gradient-norm-weighted LOO baseline.
+
+    For response ``i`` in prompt group ``g``, this uses
+
+    ``b_{-i} = sum_{j != i} ||g_j||^2 r_j / sum_{j != i} ||g_j||^2``.
+
+    Neither the reward nor the score-gradient norm of response ``i`` enters its
+    baseline. If every held-out weight is zero, the ordinary LOO reward mean is
+    used as the well-defined fallback.
+    """
+    del config
+
+    scores = token_level_rewards.sum(dim=-1)
+    if len(index) != scores.numel():
+        raise ValueError(f"index must contain one prompt id per response: got {len(index)} for {scores.numel()}")
+    weights = score_grad_norm_sq.reshape(-1).to(device=scores.device, dtype=torch.float64)
+    if weights.numel() != scores.numel():
+        raise ValueError(
+            "score_grad_norm_sq must contain one scalar per response: "
+            f"got {weights.numel()} weights for {scores.numel()} responses"
+        )
+    if not torch.isfinite(weights).all():
+        raise ValueError("score_grad_norm_sq contains NaN or infinity")
+    if (weights < 0).any():
+        raise ValueError("score_grad_norm_sq must be non-negative")
+
+    id2positions = defaultdict(list)
+    with torch.no_grad():
+        for position, prompt_id in enumerate(index):
+            id2positions[prompt_id].append(position)
+
+        scalar_advantages = torch.empty_like(scores)
+        for positions in id2positions.values():
+            group_scores = scores[positions]
+            if len(positions) == 1:
+                centered = group_scores
+                reward_std = scores.new_tensor(1.0)
+            else:
+                group_scores_fp64 = group_scores.to(torch.float64)
+                group_weights = weights[positions]
+                held_out_weight_sums = group_weights.sum() - group_weights
+                held_out_weighted_rewards = (group_weights * group_scores_fp64).sum() - (
+                    group_weights * group_scores_fp64
+                )
+                ordinary_loo_baselines = (group_scores_fp64.sum() - group_scores_fp64) / (len(positions) - 1)
+                weighted_loo_baselines = torch.where(
+                    held_out_weight_sums > 0,
+                    held_out_weighted_rewards / held_out_weight_sums.clamp_min(epsilon),
+                    ordinary_loo_baselines,
+                ).to(group_scores.dtype)
+                centered = group_scores - weighted_loo_baselines
+                reward_std = torch.std(group_scores)
+
             if norm_adv_by_std_in_grpo:
                 centered = centered / (reward_std + epsilon)
             scalar_advantages[positions] = centered

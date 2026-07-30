@@ -86,18 +86,20 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
-    if config.algorithm.adv_estimator == "grpo_gradient_norm":
+    gradient_norm_estimators = {"grpo_gradient_norm", "grpo_gradient_norm_loo"}
+    if config.algorithm.adv_estimator in gradient_norm_estimators:
+        estimator_name = config.algorithm.adv_estimator
         if not config.trainer.use_v1:
-            raise ValueError("grpo_gradient_norm is implemented only for trainer.use_v1=True")
+            raise ValueError(f"{estimator_name} is implemented only for trainer.use_v1=True")
         if config.actor_rollout_ref.actor.strategy != "fsdp":
-            raise ValueError("grpo_gradient_norm currently requires the FSDP1 actor strategy")
+            raise ValueError(f"{estimator_name} currently requires the FSDP1 actor strategy")
         if config.actor_rollout_ref.actor.fsdp_config.strategy != "fsdp":
-            raise ValueError("grpo_gradient_norm currently requires actor.fsdp_config.strategy=fsdp")
+            raise ValueError(f"{estimator_name} currently requires actor.fsdp_config.strategy=fsdp")
         if config.actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size != 1:
-            raise ValueError("grpo_gradient_norm does not support Ulysses sequence parallelism")
+            raise ValueError(f"{estimator_name} does not support Ulysses sequence parallelism")
         mixed_precision = config.actor_rollout_ref.actor.fsdp_config.get("mixed_precision", None)
         if mixed_precision is not None and mixed_precision.get("param_dtype", "bf16") in {"fp16", "float16"}:
-            raise ValueError("grpo_gradient_norm requires BF16 or FP32 actor gradients, not FP16")
+            raise ValueError(f"{estimator_name} requires BF16 or FP32 actor gradients, not FP16")
         if config.actor_rollout_ref.actor.ppo_epochs != 1:
             raise ValueError("The oracle gradient-norm ablation requires actor.ppo_epochs=1")
         if config.actor_rollout_ref.rollout.n < 2:
@@ -110,9 +112,11 @@ def validate_config(
         }
         if config.actor_rollout_ref.actor.loss_agg_mode not in supported_aggregation:
             raise ValueError(
-                "Unsupported actor.loss_agg_mode for grpo_gradient_norm: "
-                f"{config.actor_rollout_ref.actor.loss_agg_mode}"
+                f"Unsupported actor.loss_agg_mode for {estimator_name}: {config.actor_rollout_ref.actor.loss_agg_mode}"
             )
+
+    if config.algorithm.adv_estimator == "grpo_loo" and config.actor_rollout_ref.rollout.n < 2:
+        raise ValueError("The GRPO leave-one-out baseline requires rollout.n >= 2")
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

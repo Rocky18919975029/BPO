@@ -45,6 +45,7 @@ def batch_data() -> DataProto:
             ],
             dtype=torch.long,
         ),
+        "score_grad_norm_sq": torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.float64),
     }
     non_tensors = {
         "uid": np.array(["prompt_a"] * 6, dtype=object),
@@ -52,29 +53,47 @@ def batch_data() -> DataProto:
     return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
 
 
-def test_compute_advantage_for_single_trajectory(batch_data: DataProto):
+@pytest.mark.parametrize(
+    "adv_estimator",
+    [
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_LOO,
+        AdvantageEstimator.GRPO_GRADIENT_NORM,
+        AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+    ],
+)
+def test_compute_advantage_for_single_trajectory(batch_data: DataProto, adv_estimator: AdvantageEstimator):
     result = compute_advantage_for_multi_trajectories(
         data=batch_data,
         batch_keys=[f"prompt_a_{i}_0" for i in range(len(batch_data))],
-        adv_estimator=AdvantageEstimator.GRPO,
+        adv_estimator=adv_estimator,
     )
     expected = compute_advantage(
         batch_data,
-        adv_estimator=AdvantageEstimator.GRPO,
+        adv_estimator=adv_estimator,
     )
     assert torch.equal(result.batch["advantages"], expected.batch["advantages"])
     assert torch.equal(result.batch["returns"], expected.batch["returns"])
 
 
-def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
+@pytest.mark.parametrize(
+    "adv_estimator",
+    [
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_LOO,
+        AdvantageEstimator.GRPO_GRADIENT_NORM,
+        AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+    ],
+)
+def test_compute_advantage_for_multi_trajectories(batch_data: DataProto, adv_estimator: AdvantageEstimator):
     result = compute_advantage_for_multi_trajectories(
         data=batch_data,
         batch_keys=["prompt_a_0_0", "prompt_a_0_1", "prompt_a_2_0", "prompt_a_2_1", "prompt_a_3_0", "prompt_a_4_0"],
-        adv_estimator=AdvantageEstimator.GRPO,
+        adv_estimator=adv_estimator,
     )
     expected = compute_advantage(
         batch_data.select_idxs([1, 3, 4, 5]),
-        adv_estimator=AdvantageEstimator.GRPO,
+        adv_estimator=adv_estimator,
     )
     gather_row_indices = [0, 0, 1, 1, 2, 3]
     gather_col_indices = [0, 0, 1, 1, 0, 0]
