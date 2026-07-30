@@ -154,6 +154,7 @@ def compute_advantage_for_multi_trajectories(
         core_algos.AdvantageEstimator.GRPO_LOO,
         core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM,
         core_algos.AdvantageEstimator.GRPO_GRADIENT_NORM_LOO,
+        core_algos.AdvantageEstimator.POSITIVE_SFT,
     }
     if adv_estimator not in group_relative_estimators:
         return compute_advantage(

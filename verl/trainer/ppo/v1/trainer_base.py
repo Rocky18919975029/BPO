@@ -126,6 +126,7 @@ class PPOTrainer(ABC):
 
     def __init__(self, config: DictConfig):
         self.config = config
+        self._validate_positive_sft_config()
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -526,8 +527,49 @@ class PPOTrainer(ABC):
 
         # 10. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics=metrics)
+            actor_batch = batch
+            positive_sft_padding_keys: list[str] = []
+            if self._positive_sft_enabled():
+                actor_batch = self._select_positive_sft_actor_batch(batch, metrics=metrics)
+                if len(actor_batch) > 0:
+                    retained_keys = list(actor_batch.keys)
+                    original_keys = set(retained_keys)
+                    retained_row_count = len(actor_batch)
+                    actor_batch = self._balance_batch(
+                        actor_batch,
+                        metrics=metrics,
+                        logging_prefix="positive_sft_seqlen",
+                    )
+                    positive_sft_padding_keys = [key for key in actor_batch.keys if key not in original_keys]
+                    # The training iterator treats synthetic rows as zero-loss
+                    # members of a full optimizer mini-batch. Compensate once
+                    # so averaging all equally sized mini-batch updates still
+                    # realizes the mean over retained responses.
+                    padding_weight_scale = len(actor_batch) / retained_row_count
+                    if padding_weight_scale != 1.0:
+                        weights = tq.kv_batch_get(
+                            keys=retained_keys,
+                            partition_id=batch.partition_id,
+                            select_fields=["advantages", "returns"],
+                        )
+                        weights["advantages"] = weights["advantages"] * padding_weight_scale
+                        weights["returns"] = weights["returns"] * padding_weight_scale
+                        tq.kv_batch_put(
+                            keys=retained_keys,
+                            partition_id=batch.partition_id,
+                            fields=weights,
+                        )
+                    metrics["positive_sft/padding_weight_scale"] = padding_weight_scale
+
+            try:
+                if len(actor_batch) > 0:
+                    with marked_timer("update_actor", timing_raw, color="red"):
+                        self._update_actor(actor_batch, metrics=metrics)
+                elif self._positive_sft_enabled():
+                    metrics["positive_sft/update_skipped"] = 1.0
+            finally:
+                if positive_sft_padding_keys:
+                    tq.kv_clear(keys=positive_sft_padding_keys, partition_id=batch.partition_id)
 
         return batch
 
@@ -1406,7 +1448,8 @@ class PPOTrainer(ABC):
         # If there is an actor update, the batch should align with actor PPO mini-batches too.
         if self.config.trainer.critic_warmup <= self.global_steps:
             actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+            if not self._positive_sft_enabled():
+                actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
             required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
@@ -1437,6 +1480,78 @@ class PPOTrainer(ABC):
         )
         metrics.update(global_balance_stats)
         return batch
+
+    def _positive_sft_enabled(self) -> bool:
+        return self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.POSITIVE_SFT
+
+    def _validate_positive_sft_config(self) -> None:
+        if not self._positive_sft_enabled():
+            return
+        actor = self.config.actor_rollout_ref.actor
+        if actor.policy_loss.get("loss_mode", "vanilla") != "positive_sft":
+            raise ValueError("algorithm.adv_estimator=positive_sft requires actor.policy_loss.loss_mode=positive_sft")
+        if actor.loss_agg_mode != "seq-mean-token-mean":
+            raise ValueError(
+                "algorithm.adv_estimator=positive_sft requires "
+                "actor.loss_agg_mode=seq-mean-token-mean"
+            )
+        if actor.use_kl_loss or actor.entropy_coeff != 0:
+            raise ValueError("positive_sft is a pure SFT ablation and requires actor KL/entropy losses to be disabled")
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError("positive_sft selects correctness from raw verifier rewards; disable KL-in-reward")
+
+    def _select_positive_sft_actor_batch(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Retain only verifier-positive trajectories for the actor SFT pass."""
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["advantages"],
+        )
+        selected_keys: list[str] = []
+        selected_tags: list[dict] = []
+        all_prompt_ids: set[str] = set()
+        all_session_ids: set[str] = set()
+        positive_prompt_ids: set[str] = set()
+        positive_session_ids: set[str] = set()
+
+        for key, tag, advantages in zip(batch.keys, batch.tags, data["advantages"].unbind(), strict=True):
+            if tag.get("is_padding", False):
+                continue
+            fields = key.rsplit("_", 2)
+            if len(fields) != 3:
+                raise RuntimeError(f"Unexpected trajectory key format: {key}")
+            prompt_id, session_id = fields[0], f"{fields[0]}_{fields[1]}"
+            all_prompt_ids.add(prompt_id)
+            all_session_ids.add(session_id)
+            if bool(torch.any(advantages > 0).item()):
+                selected_keys.append(key)
+                selected_tags.append(tag)
+                positive_prompt_ids.add(prompt_id)
+                positive_session_ids.add(session_id)
+
+        total_responses = len(all_session_ids)
+        positive_responses = len(positive_session_ids)
+        total_prompts = len(all_prompt_ids)
+        active_prompts = len(positive_prompt_ids)
+        metrics.update(
+            {
+                "positive_sft/correct_responses": float(positive_responses),
+                "positive_sft/correct_response_fraction": positive_responses / max(total_responses, 1),
+                "positive_sft/active_prompts": float(active_prompts),
+                "positive_sft/active_prompt_fraction": active_prompts / max(total_prompts, 1),
+                "positive_sft/correct_per_active_prompt": positive_responses / max(active_prompts, 1),
+                "positive_sft/actor_rows": float(len(selected_keys)),
+                "positive_sft/update_skipped": float(not selected_keys),
+            }
+        )
+
+        return KVBatchMeta(
+            keys=selected_keys,
+            tags=selected_tags,
+            partition_id=batch.partition_id,
+            fields=batch.fields,
+            extra_info=dict(batch.extra_info),
+        )
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1768,7 +1883,8 @@ class PPOTrainer(ABC):
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        if not self._positive_sft_enabled():
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )

@@ -136,6 +136,7 @@ ROLLOUT_N=${ROLLOUT_N:-32}
 SAVE_CONTENTS=${SAVE_CONTENTS:-"['model','optimizer','extra','hf_model']"}
 SAVE_FREQ=${SAVE_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
+TRAINING_SCRIPT=${TRAINING_SCRIPT:-examples/grpo_trainer/run_qwen2_5_math_7b_reschedule_baseline_fsdp.sh}
 
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node list: ${SLURM_JOB_NODELIST}"
@@ -152,6 +153,7 @@ echo "Reuse rollout log-probs: ${ROLLOUT_LOGPROB_REUSE:-True}"
 echo "Strict boxed verifier: ${REWARD_STRICT_BOX_VERIFY:-True}"
 echo "Checkpoint contents: ${SAVE_CONTENTS}"
 echo "Resume mode: ${RESUME_MODE}"
+echo "Training script: ${TRAINING_SCRIPT}"
 
 MODEL_PATH="${MODEL_PATH}" \
 DATA_DIR="${DATA_DIR}" \
@@ -175,4 +177,4 @@ SAVE_FREQ="${SAVE_FREQ}" \
 RESUME_MODE="${RESUME_MODE}" \
 NNODES=1 \
 NGPUS_PER_NODE=8 \
-bash examples/grpo_trainer/run_qwen2_5_math_7b_reschedule_baseline_fsdp.sh "$@"
+bash "${TRAINING_SCRIPT}" "$@"

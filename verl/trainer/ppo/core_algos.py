@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -108,6 +109,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_LOO = "grpo_loo"
     GRPO_GRADIENT_NORM = "grpo_gradient_norm"
     GRPO_GRADIENT_NORM_LOO = "grpo_gradient_norm_loo"
+    POSITIVE_SFT = "positive_sft"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
@@ -380,6 +382,60 @@ def compute_grpo_loo_outcome_advantage(
         advantages = scalar_advantages.unsqueeze(-1) * response_mask
 
     return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.POSITIVE_SFT)
+def compute_positive_sft_weights(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    config: Optional[AlgoConfig] = None,
+    **_: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build problem-balanced weights for positive-only response SFT.
+
+    Responses with scalar reward above ``positive_sft_reward_threshold`` are
+    retained. If prompt ``x`` has ``n_x`` retained responses, each receives a
+    raw weight proportional to ``1 / n_x``. The weights are additionally
+    rescaled so their mean over retained responses is one:
+
+    ``w_i = N_positive / (N_active_prompts * n_x)``.
+
+    Consequently, a sequence-mean loss over retained responses is exactly an
+    equal-weight mean over active prompts, followed by an equal-weight mean
+    over each prompt's positive responses. Prompts without a positive response
+    have zero weight for the current update.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    if len(index) != scores.numel():
+        raise ValueError(f"index must contain one prompt id per response: got {len(index)} for {scores.numel()}")
+
+    threshold = 0.0 if config is None else float(config.get("positive_sft_reward_threshold", 0.0))
+    if not math.isfinite(threshold):
+        raise ValueError(f"positive_sft_reward_threshold must be finite, got {threshold}")
+
+    id2positions = defaultdict(list)
+    with torch.no_grad():
+        for position, prompt_id in enumerate(index):
+            id2positions[prompt_id].append(position)
+
+        positive_positions_by_prompt: list[list[int]] = []
+        for positions in id2positions.values():
+            positive_positions = [position for position in positions if scores[position] > threshold]
+            if positive_positions:
+                positive_positions_by_prompt.append(positive_positions)
+
+        scalar_weights = torch.zeros_like(scores)
+        positive_count = sum(len(positions) for positions in positive_positions_by_prompt)
+        active_prompt_count = len(positive_positions_by_prompt)
+        if positive_count > 0:
+            normalization = positive_count / active_prompt_count
+            for positions in positive_positions_by_prompt:
+                scalar_weights[positions] = normalization / len(positions)
+
+        weights = scalar_weights.unsqueeze(-1) * response_mask
+
+    return weights, weights
 
 
 @register_adv_est(AdvantageEstimator.GRPO_GRADIENT_NORM)
@@ -1569,6 +1625,55 @@ def compute_policy_loss_vanilla(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+@register_policy_loss("positive_sft")
+def compute_policy_loss_positive_sft(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Supervise only verifier-positive responses with problem-balanced weights.
+
+    ``advantages`` contains a constant positive weight on every response token
+    selected by :func:`compute_positive_sft_weights`. Unlike PPO, this loss
+    directly maximizes current-policy log likelihood and deliberately uses no
+    old-policy ratio, clipping, or negative-response term.
+    """
+    if loss_agg_mode != "seq-mean-token-mean":
+        raise ValueError(
+            "positive_sft requires loss_agg_mode='seq-mean-token-mean' so each "
+            "retained response is length-normalized before problem balancing"
+        )
+    if rollout_is_weights is not None:
+        raise ValueError("positive_sft does not support rollout importance weights")
+
+    positive_weights = advantages.to(dtype=log_prob.dtype)
+    sft_losses = -positive_weights * log_prob
+    pg_loss = agg_loss(
+        loss_mat=sft_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **(config.global_batch_info if config is not None else {}),
+    )
+
+    negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    active_tokens = response_mask & (positive_weights > 0)
+    if active_tokens.any():
+        weight_mean = positive_weights[active_tokens].mean()
+        approx_kl = (-negative_approx_kl)[active_tokens].mean()
+    else:
+        weight_mean = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+        approx_kl = torch.zeros((), device=log_prob.device, dtype=log_prob.dtype)
+
+    return pg_loss, {
+        "positive_sft/token_weight_mean": weight_mean.detach().item(),
+        "positive_sft/approx_kl": approx_kl.detach().item(),
+    }
 
 
 @register_policy_loss("dppo_tv")
