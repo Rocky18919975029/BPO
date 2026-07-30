@@ -718,6 +718,10 @@ class FSDPEngine(BaseEngine):
         local_response_count = int(data.shape[0])
         dp_size = self.get_data_parallel_size()
         global_response_count = local_response_count * dp_size
+        # TensorDict slicing delegates to ``tensor[start:stop]`` for every
+        # field, but jagged NestedTensor does not support slicing on dim 0.
+        # Split once through VERL's NestedTensor-aware utility instead.
+        samples = tu.chunk_tensordict(data, chunks=local_response_count) if local_response_count else []
         if self.rank == 0:
             print(
                 "[exact-gradient-norm] starting "
@@ -730,7 +734,7 @@ class FSDPEngine(BaseEngine):
         with self.train_mode(load_optimizer=False, zero_grad_on_exit=True):
             for sample_index in range(local_response_count):
                 self.optimizer_zero_grad()
-                sample = data[sample_index : sample_index + 1]
+                sample = samples[sample_index]
                 with self.module.no_sync():
                     loss, _ = self.forward_step(sample, loss_function=loss_function, forward_only=False)
                     loss.backward()

@@ -858,6 +858,22 @@ def test_chunk_tensordict():
                         assert torch.all(torch.eq(tensor.data["pixel_values"], expect["pixel_values"])).item()
 
 
+def test_chunk_tensordict_into_single_response_batches_with_nested_tensors():
+    input_rows = [torch.arange(3), torch.arange(5), torch.arange(2)]
+    input_ids = torch.nested.as_nested_tensor(input_rows, layout=torch.jagged)
+    rewards = torch.tensor([1.0, 0.0, -1.0])
+    td = tu.get_tensordict({"input_ids": input_ids, "rewards": rewards})
+
+    samples = tu.chunk_tensordict(td, chunks=len(td))
+
+    assert len(samples) == len(td)
+    for index, sample in enumerate(samples):
+        assert sample.batch_size == torch.Size([1])
+        assert sample["input_ids"].is_nested
+        assert torch.equal(sample["input_ids"].unbind(0)[0], input_rows[index])
+        assert sample["rewards"].item() == rewards[index].item()
+
+
 def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_equal_seq_len_per_chunk():
     position_ids = tu.nested_tensor_from_tensor_list(
         [
