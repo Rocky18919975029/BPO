@@ -974,20 +974,26 @@ def process_validation_metrics(
 
         for uid, var2vals in uid2var2vals.items():
             pred_vals = var2vals.get("pred")
-            has_pred = pred_vals is not None
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Reward functions may omit optional extra-info fields for some
+                # responses. The validation collector preserves alignment by
+                # inserting None, so exclude those placeholders before numeric
+                # aggregation rather than passing them to NumPy.
+                valid_indices = [index for index, value in enumerate(var_vals) if value is not None]
+                valid_vals = [var_vals[index] for index in valid_indices]
+
+                # Skip empty or string-valued fields such as ``pred``.
+                if not valid_vals or isinstance(valid_vals[0], str):
                     continue
 
                 # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                n_resps = len(valid_vals)
+                metric = {f"mean@{n_resps}": float(np_mean(valid_vals))}
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+                    metric[f"std@{n_resps}"] = float(np_std(valid_vals))
 
                     # cache ns list
                     if n_resps not in ns_cache:
@@ -998,7 +1004,7 @@ def process_validation_metrics(
                     for n in ns:
                         # compute best/worst metrics
                         (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
+                            data=valid_vals,
                             subset_size=n,
                             reduce_fns=reduce_fns_best_worst,
                             n_bootstrap=n_bootstrap,
@@ -1010,10 +1016,14 @@ def process_validation_metrics(
                         metric[f"worst@{n}/std"] = won_std
 
                         # compute maj metrics
-                        if has_pred:
+                        aligned_pred_vals = (
+                            [pred_vals[index] for index in valid_indices] if pred_vals is not None else None
+                        )
+                        if aligned_pred_vals is not None and all(pred is not None for pred in aligned_pred_vals):
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(valid_vals, aligned_pred_vals, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

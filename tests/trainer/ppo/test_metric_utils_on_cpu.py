@@ -568,6 +568,23 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_ignores_missing_optional_values(self):
+        data_sources = ["source1"] * 3
+        sample_inputs = ["prompt1"] * 3
+        infos_dict = {
+            "score": [1.0, 0.0, 1.0],
+            "optional": [2.0, None, 4.0],
+            "always_missing": [None, None, None],
+            "pred": ["A", "B", "A"],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertEqual(result["source1"]["optional"]["mean@2"], 3.0)
+        self.assertIn("maj@2/mean", result["source1"]["optional"])
+        self.assertNotIn("always_missing", result["source1"])
+        self.assertEqual(result["source1"]["score"]["mean@3"], 2.0 / 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
