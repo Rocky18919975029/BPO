@@ -286,7 +286,9 @@ class PPOTrainerTemperatureVariance(PPOTrainerSync):
         score_norm_sq = data["score_grad_norm_sq"].reshape(-1).to(torch.float64).cpu().numpy()
         prompts = list(data["prompts"].unbind())
         responses = list(data["responses"].unbind())
-        data_sources = data["data_source"].tolist()
+        # TransferQueue may return non-tensor columns as LinkedList,
+        # NonTensorStack, or numpy arrays depending on the backend.
+        data_sources = list(data["data_source"])
 
         shape = (len(uid_to_problem), response_count)
         result: dict[str, Any] = {
