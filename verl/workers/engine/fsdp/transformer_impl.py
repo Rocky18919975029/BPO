@@ -715,9 +715,20 @@ class FSDPEngine(BaseEngine):
         if getattr(self, "scaler", None) is not None:
             raise NotImplementedError("Exact per-response gradient norms currently require BF16 or FP32 training")
 
+        local_response_count = int(data.shape[0])
+        dp_size = self.get_data_parallel_size()
+        global_response_count = local_response_count * dp_size
+        if self.rank == 0:
+            print(
+                "[exact-gradient-norm] starting "
+                f"{local_response_count} synchronized rounds for {global_response_count} responses "
+                f"across {dp_size} data-parallel ranks",
+                flush=True,
+            )
+
         norms = []
         with self.train_mode(load_optimizer=False, zero_grad_on_exit=True):
-            for sample_index in range(data.shape[0]):
+            for sample_index in range(local_response_count):
                 self.optimizer_zero_grad()
                 sample = data[sample_index : sample_index + 1]
                 with self.module.no_sync():
@@ -731,6 +742,13 @@ class FSDPEngine(BaseEngine):
                     )
                 norms.append(norm_sq)
                 self.optimizer_zero_grad()
+                if self.rank == 0:
+                    completed_rounds = sample_index + 1
+                    print(
+                        f"[exact-gradient-norm] round {completed_rounds}/{local_response_count} complete "
+                        f"({completed_rounds * dp_size}/{global_response_count} responses)",
+                        flush=True,
+                    )
 
         return torch.stack(norms) if norms else torch.empty(0, device=get_device_id(), dtype=torch.float64)
 
